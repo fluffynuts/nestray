@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""
+Nestray - A systray application for Thunderbird
+Shows unread mail status and allows click-to-raise Thunderbird.
+"""
+
+import configparser
+import re
+import subprocess
+import sys
+import threading
+import time
+import os
+from pathlib import Path
+
+qt5_forced = os.getenv("FORCE_QT5")
+force_qt5 = qt5_forced is not None and qt5_forced != "0"
+
+try:
+    if force_qt5:
+        raise Exception("qt5 forced")
+    from PyQt6.QtCore import QThread, pyqtSignal
+    from PyQt6.QtGui import QIcon
+    from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
+    print("nestray: using qt6")
+except:
+    from PyQt5.QtCore import QThread, pyqtSignal
+    from PyQt5.QtGui import QIcon
+    from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
+    print("nestray: using qt5")
+
+
+# --- Constants ---
+
+CONFIG_PATH = Path.home() / ".config" / "nestray.ini"
+TB_PROFILE_BASE = Path.home() / ".thunderbird"
+
+DEFAULTS = {
+    "General": {
+        "PollInterval": "10",
+        "RaiseTimeout": "5",
+        "DesktopNotifications": "1",
+        "RemindInterval": "30",
+        "Debug": "0",
+    }
+}
+
+have_unread_mail_icon = "mail-mark-read"
+have_no_unread_mail_icon = "mail-mark-unread"
+
+
+# --- Logger ---
+
+class Logger:
+    """Simple debug logger. Only prints when debug mode is enabled."""
+
+    def __init__(self, debug: bool = False):
+        self.debug = debug
+
+    def log(self, msg: str) -> None:
+        if self.debug:
+            print(f"nestray: {msg}")
+
+
+# Global instance — initialised with debug=False, reconfigured after config is loaded.
+logger = Logger()
+
+
+# --- Config ---
+
+def load_config() -> configparser.ConfigParser:
+    """Load or create the config file, filling in any missing defaults."""
+    config = configparser.ConfigParser(allow_no_value=False)
+
+    if CONFIG_PATH.exists():
+        config.read(CONFIG_PATH)
+
+    changed = False
+    for section, keys in DEFAULTS.items():
+        if not config.has_section(section):
+            config.add_section(section)
+            changed = True
+        for key, value in keys.items():
+            if not config.has_option(section, key):
+                config.set(section, key, value)
+                changed = True
+
+    if changed:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            # Write with comments if creating fresh
+            if not CONFIG_PATH.exists() or CONFIG_PATH.stat().st_size == 0:
+                f.write("[General]\n")
+                f.write("# the period between polls of the IMAP folder, in seconds\n")
+                f.write(f"PollInterval={config.get('General', 'PollInterval')}\n")
+                f.write("# the maximum time to poll for the thunderbird window when attempting to raise it, in seconds\n")
+                f.write(f"RaiseTimeout={config.get('General', 'RaiseTimeout')}\n")
+                f.write("# whether to raise desktop notifications for unread mail (1 = enabled, 0 = disabled)\n")
+                f.write(f"DesktopNotifications={config.get('General', 'DesktopNotifications')}\n")
+                f.write("# minutes to wait before re-notifying about the same unread count\n")
+                f.write(f"RemindInterval={config.get('General', 'RemindInterval')}\n")
+                f.write("# enable debug logging (1 = enabled, 0 = disabled)\n")
+                f.write(f"Debug={config.get('General', 'Debug')}\n")
+            else:
+                config.write(f)
+
+    return config
+
+
+# --- Thunderbird profile detection ---
+
+def get_thunderbird_profile_path() -> Path | None:
+    """
+    Determine the active Thunderbird profile directory.
+    Prefers install record (modern TB), falls back to Default=1.
+    """
+    ini_path = TB_PROFILE_BASE / "profiles.ini"
+    if not ini_path.exists():
+        return None
+
+    ini = configparser.ConfigParser()
+    ini.read(ini_path)
+
+    # Prefer install record
+    for section in ini.sections():
+        if section.startswith("Install") and ini.has_option(section, "Default"):
+            rel_path = ini.get(section, "Default")
+            return TB_PROFILE_BASE / rel_path
+
+    # Fall back to Default=1
+    for section in ini.sections():
+        if ini.get(section, "Default", fallback="0") == "1":
+            path = ini.get(section, "Path", fallback=None)
+            if path is None:
+                continue
+            if ini.get(section, "IsRelative", fallback="0") == "1":
+                return TB_PROFILE_BASE / path
+            return Path(path)
+
+    return None
+
+
+# --- Unread mail counting via .msf (Mork index) files ---
+
+# Mork field A2 = numNewMsgs, stored as hex.
+# The ^ prefix is literal Mork syntax (column namespace), not a regex anchor.
+_A2_PATTERN = re.compile(r"\(\^A2=([0-9a-fA-F]+)\)")
+
+
+def find_inbox_msf_files(profile_path: Path) -> list[Path]:
+    """
+    Find INBOX.msf index files in the profile.
+    If a smart mailbox (unified inbox) exists and has content, return only that
+    to avoid double-counting. Otherwise aggregate from individual accounts.
+    """
+    smart = profile_path / "Mail" / "smart mailboxes" / "Inbox.msf"
+    if smart.exists() and smart.stat().st_size > 0:
+        return [smart]
+
+    msf_files: list[Path] = []
+    for search_root in [profile_path / "Mail", profile_path / "ImapMail"]:
+        if not search_root.exists():
+            continue
+        for account_dir in search_root.iterdir():
+            if not account_dir.is_dir():
+                continue
+            # Try exact name first, then case-insensitive fallback
+            candidate = account_dir / "INBOX.msf"
+            if not candidate.exists():
+                for item in account_dir.iterdir():
+                    if item.name.lower() == "inbox.msf" and item.is_file():
+                        candidate = item
+                        break
+                else:
+                    continue
+            if candidate.exists() and candidate.stat().st_size > 0:
+                msf_files.append(candidate)
+
+    return msf_files
+
+
+def get_unread_from_msf(msf_path: Path) -> int:
+    """
+    Extract the unread count from a .msf file by finding the last
+    occurrence of the A2 (numNewMsgs) field in the Mork data.
+    Mork appends updates, so the last match is the most current value.
+    """
+    try:
+        data = msf_path.read_text(errors="replace")
+    except OSError as e:
+        print(f"nestray: could not read {msf_path}: {e}", file=sys.stderr)
+        return 0
+
+    matches = _A2_PATTERN.findall(data)
+    if not matches:
+        return 0
+
+    return int(matches[-1], 16)
+
+
+def get_total_unread(profile_path: Path) -> int:
+    """
+    Count total unread messages across Inbox .msf files in the profile.
+    Uses the smart mailbox (unified inbox) if available, otherwise
+    aggregates from individual IMAP/local/POP3 account inboxes.
+    """
+    total = 0
+    for msf_path in find_inbox_msf_files(profile_path):
+        total += get_unread_from_msf(msf_path)
+    return total
+
+
+# --- Window raising ---
+
+def is_thunderbird_running() -> bool:
+    """Check if a Thunderbird process is currently running."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "thunderbird"],
+            capture_output=True, timeout=2
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def launch_thunderbird_minimized(timeout: float) -> None:
+    """
+    Launch Thunderbird and minimize its window so it syncs mail in the
+    background without appearing on screen. No-op if already running.
+    This function blocks until the window is minimized or the timeout expires,
+    so it should only be called from a background thread.
+    """
+    if is_thunderbird_running():
+        return
+
+    logger.log("thunderbird not running, launching minimized")
+    try:
+        subprocess.Popen(
+            ["thunderbird"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        print("nestray: thunderbird not found in your PATH", file=sys.stderr)
+        return
+
+    # Wait for the window to appear, then minimize it
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        wid = find_thunderbird_window()
+        if wid is not None:
+            try:
+                subprocess.run(
+                    ["kdotool", "windowminimize", wid],
+                    capture_output=True, timeout=2
+                )
+                logger.log("thunderbird launched and minimized")
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+            return
+        time.sleep(0.05)
+
+    print("nestray: thunderbird launched but window not found to minimize", file=sys.stderr)
+
+
+class EnsureThunderbirdThread(QThread):
+    """Ensures Thunderbird is running (and minimized) in the background."""
+
+    def __init__(self, raise_timeout: float):
+        super().__init__()
+        self.raise_timeout = raise_timeout
+
+    def run(self) -> None:
+        launch_thunderbird_minimized(self.raise_timeout)
+
+
+def find_thunderbird_window() -> str | None:
+    """Find the Thunderbird window ID via kdotool, or None if not found."""
+    try:
+        result = subprocess.run(
+            ["kdotool", "search", "--name", "Thunderbird"],
+            capture_output=True, text=True, timeout=2
+        )
+        window_ids = result.stdout.strip().splitlines()
+        if window_ids:
+            logger.log(f"found thunderbird window(s): {window_ids}")
+            return window_ids[0]
+        logger.log("no thunderbird window found")
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"nestray: kdotool search failed: {e}", file=sys.stderr)
+        return None
+
+
+def toggle_thunderbird_window() -> None:
+    """
+    Toggle the Thunderbird window:
+      - If a window is found and is the active window, minimize it.
+      - If a window is found but is not active (including minimized), activate it.
+      - If no window is found, run the thunderbird executable. This will
+        either raise an existing instance or start a new one.
+    """
+    logger.log("toggle requested")
+    wid = find_thunderbird_window()
+
+    if wid is not None:
+        # Check if TB is the currently active (focused) window
+        is_active = False
+        try:
+            active = subprocess.run(
+                ["kdotool", "getactivewindow"],
+                capture_output=True, text=True, timeout=2
+            )
+            active_wid = active.stdout.strip()
+            is_active = active_wid == wid
+            logger.log(f"active window: {active_wid}, thunderbird window: {wid}, is_active: {is_active}")
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logger.log(f"getactivewindow failed: {e}, assuming not active")
+
+        if is_active:
+            logger.log(f"minimizing window {wid}")
+            try:
+                subprocess.run(
+                    ["kdotool", "windowminimize", wid],
+                    capture_output=True, timeout=2
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                print(f"nestray: windowminimize failed: {e}", file=sys.stderr)
+        else:
+            logger.log(f"activating window {wid}")
+            try:
+                subprocess.run(
+                    ["kdotool", "windowactivate", wid],
+                    capture_output=True, timeout=2
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                print(f"nestray: windowactivate failed: {e}", file=sys.stderr)
+        return
+
+    # No window found — run thunderbird (raises existing or starts new)
+    logger.log("launching thunderbird executable")
+    try:
+        subprocess.Popen(
+            ["thunderbird"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        print("nestray: thunderbird not found in your PATH", file=sys.stderr)
+
+
+class ToggleThread(QThread):
+    """
+    Toggles the Thunderbird window in a background thread so the tray
+    stays responsive.
+    """
+
+    def run(self) -> None:
+        toggle_thunderbird_window()
+
+
+# --- Poll worker thread ---
+
+class MailPoller(QThread):
+    """Background thread that polls for unread mail on a timer."""
+    poll_started = pyqtSignal()
+    poll_finished = pyqtSignal(int)  # unread count
+    ensure_thunderbird = pyqtSignal()  # request TB launch from main thread
+
+    def __init__(self, profile_path: Path, interval: int):
+        super().__init__()
+        self.profile_path = profile_path
+        self.interval = interval
+        self._stop_event = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            # Ask the main thread to ensure TB is running (non-blocking)
+            if not is_thunderbird_running():
+                self.ensure_thunderbird.emit()
+            self.poll_started.emit()
+            try:
+                unread = get_total_unread(self.profile_path)
+                logger.log(f"there are {unread} unread mails")
+            except Exception as e:
+                print(f"nestray: error polling mail: {e}", file=sys.stderr)
+                unread = 0
+            self.poll_finished.emit(unread)
+            self._stop_event.wait(self.interval)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self.wait()
+
+
+# --- Main tray application ---
+
+class NestrayApp:
+    def __init__(self, app: QApplication):
+        self.app = app
+        self.config = load_config()
+        logger.debug = self.config.getboolean("General", "Debug", fallback=False)
+        self.poll_interval = self.config.getint("General", "PollInterval", fallback=30)
+        self.raise_timeout = self.config.getfloat("General", "RaiseTimeout", fallback=5.0)
+        self.desktop_notifications = self.config.getboolean("General", "DesktopNotifications", fallback=True)
+        self.remind_interval = self.config.getint("General", "RemindInterval", fallback=30) * 60  # stored as minutes, used as seconds
+
+        # Notification state
+        self._last_unread = 0
+        self._last_notify_time: float = 0.0
+
+        # Validate profile
+        self.profile_path = get_thunderbird_profile_path()
+        if self.profile_path is None or not self.profile_path.exists():
+            QMessageBox.critical(
+                None,
+                "Nestray",
+                "No Thunderbird profile found.\n\n"
+                "Please ensure Thunderbird has been run at least once.",
+            )
+            sys.exit(1)
+
+        # Build tray icon
+        self.tray = QSystemTrayIcon()
+        self.tray.setIcon(QIcon.fromTheme(have_no_unread_mail_icon))
+        self.tray.setToolTip("Open Thunderbird")
+
+        # Right-click menu
+        menu = QMenu()
+        exit_action = menu.addAction("Exit")
+        exit_action.triggered.connect(self._on_exit)
+        self.tray.setContextMenu(menu)
+
+        # Left-click to launch/raise
+        self.tray.activated.connect(self._on_tray_activated)
+
+        # Keep references to background threads so they aren't GC'd
+        self._launch_thread: ToggleThread | None = None
+        self._ensure_thread: EnsureThunderbirdThread | None = None
+
+        self.tray.show()
+
+        # Start mail poller
+        self.poller = MailPoller(self.profile_path, self.poll_interval)
+        self.poller.poll_started.connect(self._on_poll_started)
+        self.poller.poll_finished.connect(self._on_poll_finished)
+        self.poller.ensure_thunderbird.connect(self._ensure_thunderbird_running)
+        self.poller.start()
+
+    def _on_poll_started(self) -> None:
+        self.tray.setIcon(QIcon.fromTheme("folder-sync"))
+        self.tray.setToolTip("Checking mail...")
+
+    def _on_poll_finished(self, unread: int) -> None:
+        if unread > 0:
+            self.tray.setIcon(QIcon.fromTheme(have_unread_mail_icon))
+            self.tray.setToolTip(f"{unread} unread")
+            self._maybe_notify(unread)
+        else:
+            self.tray.setIcon(QIcon.fromTheme(have_no_unread_mail_icon))
+            self.tray.setToolTip("Open Thunderbird")
+        self._last_unread = unread
+
+    def _maybe_notify(self, unread: int) -> None:
+        """Raise a desktop notification if the count increased or the remind interval has elapsed."""
+        if not self.desktop_notifications:
+            return
+
+        now = time.monotonic()
+        count_increased = unread > self._last_unread
+        remind_elapsed = (now - self._last_notify_time) >= self.remind_interval
+
+        if count_increased or remind_elapsed:
+            self.tray.showMessage(
+                "Nestray",
+                f"There are {unread} unread emails waiting for you",
+                QSystemTrayIcon.MessageIcon.Information,
+                5000,
+            )
+            self._last_notify_time = now
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        logger.log(f"tray activated, reason={reason}")
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._toggle_thunderbird()
+
+    def _toggle_thunderbird(self) -> None:
+        """Toggle Thunderbird window visibility in a background thread."""
+        if self._launch_thread is not None and self._launch_thread.isRunning():
+            logger.log("toggle thread still running, skipping")
+            return
+        logger.log("starting toggle thread")
+        self._launch_thread = ToggleThread()
+        self._launch_thread.start()
+
+    def _ensure_thunderbird_running(self) -> None:
+        """Launch Thunderbird minimized in a background thread if not already running."""
+        if self._ensure_thread is not None and self._ensure_thread.isRunning():
+            return
+        self._ensure_thread = EnsureThunderbirdThread(self.raise_timeout)
+        self._ensure_thread.start()
+
+    def _on_exit(self) -> None:
+        self.poller.stop()
+        if self._launch_thread is not None and self._launch_thread.isRunning():
+            self._launch_thread.wait()
+        if self._ensure_thread is not None and self._ensure_thread.isRunning():
+            self._ensure_thread.wait()
+        self.tray.hide()
+        self.app.quit()
+
+def write_pid_file(pidfile):
+    with open(pidfile, "w") as fp:
+        pid = str(os.getpid())
+        logger.log(f"writing pidfile with pid {pid}")
+        fp.write(pid)
+
+def is_already_running():
+    logger.log(f"my pid: {os.getpid()}")
+    pidfile = "/tmp/nestray.pid"
+    if not os.path.exists(pidfile):
+        logger.log("pidfile not found")
+        write_pid_file(pidfile)
+        return False
+    with open(pidfile, "r") as fp:
+        existing_pid = int(fp.read().strip())
+        logger.log(f"pidfile found with pid {existing_pid}")
+        try:
+            os.kill(existing_pid, 0)
+            logger.log("kill-0 success")
+            logger.log("nestray is already running")
+            return True
+        except ProcessLookupError as e:
+            logger.log(f"kill-0 fails: {e}")
+            write_pid_file(pidfile)
+            return False
+
+
+def main() -> None:
+    if is_already_running():
+        sys.exit(1)
+
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        print("nestray: system tray not available", file=sys.stderr)
+        sys.exit(1)
+
+    nestray = NestrayApp(app)  # noqa: F841 — keep reference alive
+    sys.exit(app.exec())
+
+def install_application_menu_item_if_necessary():
+    desktop_file = "nestray.desktop";
+    if sys.platform == "win32" or sys.platform == "darwin":
+        logger.log("warning: no menu shortcut will be created - only supported on linux for now")
+        return
+    home = Path.home()
+    target = os.path.join(home, ".local", "share", "applications", desktop_file)
+    if os.path.isfile(target):
+        logger.log(f".desktop file already found at: {target}")
+        return
+    my_dir = str(Path(__file__).resolve().parent)
+    source = os.path.join(my_dir, desktop_file)
+    if not os.path.isfile(source):
+        logger.log(f"warning: unable to install desktop file: not found at '{source}'")
+        return
+    with open(source, "r", encoding="utf-8") as fp:
+        source_lines = fp.read().splitlines()
+
+    with open(target, "w", encoding="utf-8", newline=None) as fp:
+        for line in source_lines:
+            to_write = line.replace("$INSTALL_PATH$", my_dir)
+            fp.write(f"{to_write}\n")
+    logger.log(f"installed desktop file at: {target}")
+
+if __name__ == "__main__":
+    install_application_menu_item_if_necessary()
+    main()

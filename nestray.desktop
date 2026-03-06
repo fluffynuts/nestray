@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Nestray
+Comment=Thunderbird system tray indicator
+# Update Exec to the full path where you've installed nestray.py
+Exec=$INSTALL_PATH$/nestray.py
+Icon=mail-mark-unread
+Terminal=false
+Categories=Office;Email;
+Keywords=thunderbird;mail;tray;email;unread;
+StartupNotify=false
