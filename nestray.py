@@ -532,6 +532,7 @@ def is_already_running():
             os.kill(existing_pid, 0)
             logger.log("kill-0 success")
             logger.log("nestray is already running")
+            print(f"nestray is already running with pid {existing_pid}")
             return True
         except ProcessLookupError as e:
             logger.log(f"kill-0 fails: {e}")
