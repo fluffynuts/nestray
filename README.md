@@ -9,6 +9,10 @@ A very simply systray application for Thunderbird, with the following features:
 4. will remind you every 1/2 hour if there is unread mail still in your inbox
 5. all configured via ~/.config/nestray.ini
 
+NOTE: currently only supports IMAP mailboxes (since that's what I use, and
+I wanted something to replace birdtray that just worked for me - feel free
+to fork & PR for pop3 support).
+
 
 ~/.config/nestray.ini will be created for you on first run, and if any new
 options are added, on an update, it will add the option with the default value
