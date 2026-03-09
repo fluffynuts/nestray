@@ -4,6 +4,7 @@ Nestray - A systray application for Thunderbird
 Shows unread mail status and allows click-to-raise Thunderbird.
 """
 
+import argparse
 import configparser
 import re
 import subprocess
@@ -352,6 +353,39 @@ def toggle_thunderbird_window() -> None:
         print("nestray: thunderbird not found in your PATH", file=sys.stderr)
 
 
+def raise_thunderbird_window() -> None:
+    """
+    Raise (activate) the Thunderbird window without toggling.
+    If already active, this is a no-op. If no window is found,
+    launch Thunderbird.
+    """
+    logger.log("raise requested")
+    wid = find_thunderbird_window()
+
+    if wid is not None:
+        logger.log(f"activating window {wid}")
+        try:
+            subprocess.run(
+                ["kdotool", "windowactivate", wid],
+                capture_output=True, timeout=2
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            print(f"nestray: windowactivate failed: {e}", file=sys.stderr)
+        return
+
+    # No window found — run thunderbird (raises existing or starts new)
+    logger.log("launching thunderbird executable")
+    try:
+        subprocess.Popen(
+            ["thunderbird"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        print("nestray: thunderbird not found in your PATH", file=sys.stderr)
+
+
 class ToggleThread(QThread):
     """
     Toggles the Thunderbird window in a background thread so the tray
@@ -399,7 +433,7 @@ class MailPoller(QThread):
 # --- Main tray application ---
 
 class NestrayApp:
-    def __init__(self, app: QApplication):
+    def __init__(self, app: QApplication, raise_on_start: bool = False):
         self.app = app
         self.config = load_config()
         logger.debug = self.config.getboolean("General", "Debug", fallback=False)
@@ -407,6 +441,9 @@ class NestrayApp:
         self.raise_timeout = self.config.getfloat("General", "RaiseTimeout", fallback=5.0)
         self.desktop_notifications = self.config.getboolean("General", "DesktopNotifications", fallback=True)
         self.remind_interval = self.config.getint("General", "RemindInterval", fallback=30) * 60  # stored as minutes, used as seconds
+
+        # When --raise is passed on first startup, skip the initial minimize
+        self._skip_first_minimize = raise_on_start
 
         # Notification state
         self._last_unread = 0
@@ -498,6 +535,22 @@ class NestrayApp:
 
     def _ensure_thunderbird_running(self) -> None:
         """Launch Thunderbird minimized in a background thread if not already running."""
+        if self._skip_first_minimize:
+            self._skip_first_minimize = False
+            logger.log("--raise: skipping minimize on first poll")
+            if not is_thunderbird_running():
+                # Launch TB but don't minimize — let it appear normally
+                logger.log("thunderbird not running, launching (no minimize)")
+                try:
+                    subprocess.Popen(
+                        ["thunderbird"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                except FileNotFoundError:
+                    print("nestray: thunderbird not found in your PATH", file=sys.stderr)
+            return
         if self._ensure_thread is not None and self._ensure_thread.isRunning():
             return
         self._ensure_thread = EnsureThunderbirdThread(self.raise_timeout)
@@ -518,13 +571,18 @@ def write_pid_file(pidfile):
         logger.log(f"writing pidfile with pid {pid}")
         fp.write(pid)
 
-def is_already_running():
+def get_running_pid() -> int | None:
+    """
+    Check if another nestray instance is running.
+    Returns the PID of the running instance, or None if not running.
+    Writes our own PID file if no other instance is found.
+    """
     logger.log(f"my pid: {os.getpid()}")
     pidfile = "/tmp/nestray.pid"
     if not os.path.exists(pidfile):
         logger.log("pidfile not found")
         write_pid_file(pidfile)
-        return False
+        return None
     with open(pidfile, "r") as fp:
         existing_pid = int(fp.read().strip())
         logger.log(f"pidfile found with pid {existing_pid}")
@@ -532,16 +590,35 @@ def is_already_running():
             os.kill(existing_pid, 0)
             logger.log("kill-0 success")
             logger.log("nestray is already running")
-            print(f"nestray is already running with pid {existing_pid}")
-            return True
+            return existing_pid
         except ProcessLookupError as e:
             logger.log(f"kill-0 fails: {e}")
             write_pid_file(pidfile)
-            return False
+            return None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Nestray - Thunderbird systray app")
+    parser.add_argument(
+        "--raise", dest="raise_window", action="store_true",
+        help="Raise the Thunderbird window. If nestray is already running, "
+             "raises the window and exits. If starting fresh, "
+             "skips the initial window minimize.",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
-    if is_already_running():
+    args = parse_args()
+
+    existing_pid = get_running_pid()
+
+    if existing_pid is not None:
+        if args.raise_window:
+            logger.log(f"raising thunderbird window")
+            raise_thunderbird_window()
+        else:
+            print(f"nestray is already running with pid {existing_pid}")
         sys.exit(1)
 
     app = QApplication(sys.argv)
@@ -551,7 +628,7 @@ def main() -> None:
         print("nestray: system tray not available", file=sys.stderr)
         sys.exit(1)
 
-    nestray = NestrayApp(app)  # noqa: F841 — keep reference alive
+    nestray = NestrayApp(app, raise_on_start=args.raise_window)  # noqa: F841 — keep reference alive
     sys.exit(app.exec())
 
 def install_application_menu_item_if_necessary():
