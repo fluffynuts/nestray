@@ -511,9 +511,10 @@ class NestrayApp:
         remind_elapsed = (now - self._last_notify_time) >= self.remind_interval
 
         if count_increased or remind_elapsed:
+            emails = "emails" if unread > 1 else "email"
             self.tray.showMessage(
                 "Nestray",
-                f"There are {unread} unread emails waiting for you",
+                f"You have {unread} unread {emails}",
                 QSystemTrayIcon.MessageIcon.Information,
                 5000,
             )
