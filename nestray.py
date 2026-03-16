@@ -25,10 +25,14 @@ try:
     from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
     print("nestray: using qt6")
 except:
-    from PyQt5.QtCore import QThread, pyqtSignal
-    from PyQt5.QtGui import QIcon
-    from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
-    print("nestray: using qt5")
+    try:
+        from PyQt5.QtCore import QThread, pyqtSignal
+        from PyQt5.QtGui import QIcon
+        from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
+        print("nestray: using qt5")
+    except:
+        print("you need pyqt6 or pyqt5 installed to run nestray")
+        sys.exit(1)
 
 
 # --- Constants ---
@@ -55,7 +59,7 @@ have_no_unread_mail_icon = "mail-mark-unread"
 class Logger:
     """Simple debug logger. Only prints when debug mode is enabled."""
 
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = True):
         self.debug = debug
 
     def log(self, msg: str) -> None:
@@ -156,17 +160,21 @@ def find_inbox_msf_files(profile_path: Path) -> list[Path]:
     """
     smart = profile_path / "Mail" / "smart mailboxes" / "Inbox.msf"
     if smart.exists() and smart.stat().st_size > 0:
+        print(f"found unified inbox: {smart}")
         return [smart]
 
     msf_files: list[Path] = []
     for search_root in [profile_path / "Mail", profile_path / "ImapMail"]:
+        print(f"search for msf files under {search_root}")
         if not search_root.exists():
+            print("not found")
             continue
         for account_dir in search_root.iterdir():
             if not account_dir.is_dir():
                 continue
             # Try exact name first, then case-insensitive fallback
             candidate = account_dir / "INBOX.msf"
+            print(f"candidate: {candidate}")
             if not candidate.exists():
                 for item in account_dir.iterdir():
                     if item.name.lower() == "inbox.msf" and item.is_file():
@@ -174,6 +182,7 @@ def find_inbox_msf_files(profile_path: Path) -> list[Path]:
                         break
                 else:
                     continue
+            print(f"candidate: {candidate}")
             if candidate.exists() and candidate.stat().st_size > 0:
                 msf_files.append(candidate)
 
@@ -192,6 +201,7 @@ def get_unread_from_msf(msf_path: Path) -> int:
         print(f"nestray: could not read {msf_path}: {e}", file=sys.stderr)
         return 0
 
+    print(f"data {data}")
     matches = _A2_PATTERN.findall(data)
     if not matches:
         return 0
@@ -206,6 +216,7 @@ def get_total_unread(profile_path: Path) -> int:
     aggregates from individual IMAP/local/POP3 account inboxes.
     """
     total = 0
+    print(f"looking for msf files under {profile_path}")
     for msf_path in find_inbox_msf_files(profile_path):
         total += get_unread_from_msf(msf_path)
     return total
