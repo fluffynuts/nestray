@@ -13,6 +13,24 @@ NOTE: currently only supports IMAP mailboxes (since that's what I use, and
 I wanted something to replace birdtray that just worked for me - feel free
 to fork & PR for pop3 support).
 
+### Requirements
+- pyqt6, or pyqt5 (fails over to pyqt5)
+- kdotool
+  - the best option is to install with your package manager,
+    but if it's not available, there is a bundled binary you
+    can enable via config. I built this binary myself, from
+    the kdotool github repository. If you don't trust me, that's
+    also ok:
+    - clone https://github.com/jinliu/kdotool
+    - build with `cargo build --release`
+    - either copy the output (target/release/kdotool) to
+      somewhere in your path, or overwrite the kdotool binary
+      in this repository and enable using the bundled kdotool,
+      though this may give you issues when attempting to update
+      this repository locally.
+
+
+### Configuration
 
 ~/.config/nestray.ini will be created for you on first run, and if any new
 options are added, on an update, it will add the option with the default value
@@ -27,6 +45,8 @@ RaiseTimeout=5
 DesktopNotifications=1
 # minutes to wait before re-notifying about the same unread count
 RemindInterval=30
+# use the kdotool binary bundled alongside nestray.py (1 = enabled, 0 = disabled)
+UseBundledKdoTool=1
 # enable debug logging (1 = enabled, 0 = disabled)
 Debug=0
 ```

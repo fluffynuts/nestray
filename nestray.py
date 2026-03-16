@@ -7,6 +7,7 @@ Shows unread mail status and allows click-to-raise Thunderbird.
 import argparse
 import configparser
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -46,6 +47,7 @@ DEFAULTS = {
         "RaiseTimeout": "5",
         "DesktopNotifications": "1",
         "RemindInterval": "30",
+        "UseBundledKdoTool": "0",
         "Debug": "0",
     }
 }
@@ -104,12 +106,53 @@ def load_config() -> configparser.ConfigParser:
                 f.write(f"DesktopNotifications={config.get('General', 'DesktopNotifications')}\n")
                 f.write("# minutes to wait before re-notifying about the same unread count\n")
                 f.write(f"RemindInterval={config.get('General', 'RemindInterval')}\n")
+                f.write("# use the kdotool binary bundled alongside nestray.py (1 = enabled, 0 = disabled)\n")
+                f.write(f"UseBundledKdoTool={config.get('General', 'UseBundledKdoTool')}\n")
                 f.write("# enable debug logging (1 = enabled, 0 = disabled)\n")
                 f.write(f"Debug={config.get('General', 'Debug')}\n")
             else:
                 config.write(f)
 
     return config
+
+
+# --- kdotool resolution ---
+
+# Resolved path to kdotool — set once by resolve_kdotool().
+_kdotool: str | None = None
+
+
+def resolve_kdotool(config: configparser.ConfigParser) -> str | None:
+    """
+    Determine which kdotool binary to use.
+    If UseBundledKdoTool is enabled, use the binary alongside nestray.py.
+    Otherwise, look for kdotool in PATH and warn if not found.
+    """
+    use_bundled = config.getboolean("General", "UseBundledKdoTool", fallback=False)
+
+    if use_bundled:
+        bundled = Path(__file__).resolve().parent / "kdotool"
+        if bundled.exists() and os.access(bundled, os.X_OK):
+            logger.log(f"using bundled kdotool: {bundled}")
+            return str(bundled)
+        print(
+            f"nestray: UseBundledKdoTool is enabled but bundled binary not found at {bundled}",
+            file=sys.stderr,
+        )
+        return None
+
+    system_kdotool = shutil.which("kdotool")
+    if system_kdotool is not None:
+        logger.log(f"using system kdotool: {system_kdotool}")
+        return system_kdotool
+
+    print(
+        "nestray: kdotool not found in PATH. Window management will not work.\n"
+        "  You can set UseBundledKdoTool=1 in ~/.config/nestray.ini to use the\n"
+        "  version bundled in the nestray repository.",
+        file=sys.stderr,
+    )
+    return None
 
 
 # --- Thunderbird profile detection ---
@@ -147,9 +190,20 @@ def get_thunderbird_profile_path() -> Path | None:
 
 # --- Unread mail counting via .msf (Mork index) files ---
 
-# Mork field A2 = numNewMsgs, stored as hex.
-# The ^ prefix is literal Mork syntax (column namespace), not a regex anchor.
-_A2_PATTERN = re.compile(r"\(\^A2=([0-9a-fA-F]+)\)")
+# Pattern to parse the column dictionary at the top of a Mork file.
+# Entries look like (A2=numNewMsgs) — the column ID is hex, the name is a string.
+_COLUMN_DICT_PATTERN = re.compile(r"\(([0-9a-fA-F]+)=([^)]+)\)")
+
+
+def _find_num_new_msgs_column(data: str) -> str | None:
+    """
+    Parse the Mork column dictionary to find which column ID maps to
+    numNewMsgs. Column IDs are not fixed across Thunderbird versions/profiles.
+    """
+    for col_id, col_name in _COLUMN_DICT_PATTERN.findall(data):
+        if col_name == "numNewMsgs":
+            return col_id
+    return None
 
 
 def find_inbox_msf_files(profile_path: Path) -> list[Path]:
@@ -191,8 +245,9 @@ def find_inbox_msf_files(profile_path: Path) -> list[Path]:
 
 def get_unread_from_msf(msf_path: Path) -> int:
     """
-    Extract the unread count from a .msf file by finding the last
-    occurrence of the A2 (numNewMsgs) field in the Mork data.
+    Extract the unread count from a .msf file by:
+    1. Parsing the Mork column dictionary to find the ID for numNewMsgs.
+    2. Finding the last occurrence of that field in the data.
     Mork appends updates, so the last match is the most current value.
     """
     try:
@@ -201,8 +256,15 @@ def get_unread_from_msf(msf_path: Path) -> int:
         print(f"nestray: could not read {msf_path}: {e}", file=sys.stderr)
         return 0
 
-    print(f"data {data}")
-    matches = _A2_PATTERN.findall(data)
+    col_id = _find_num_new_msgs_column(data)
+    if col_id is None:
+        logger.log(f"numNewMsgs column not found in {msf_path}")
+        return 0
+
+    logger.log(f"numNewMsgs column is {col_id} in {msf_path}")
+    # The ^ prefix is literal Mork syntax (column namespace), not a regex anchor.
+    pattern = re.compile(r"\(\^" + col_id + r"=([0-9a-fA-F]+)\)")
+    matches = pattern.findall(data)
     if not matches:
         return 0
 
@@ -265,7 +327,7 @@ def launch_thunderbird_minimized(timeout: float) -> None:
         if wid is not None:
             try:
                 subprocess.run(
-                    ["kdotool", "windowminimize", wid],
+                    [_kdotool, "windowminimize", wid],
                     capture_output=True, timeout=2
                 )
                 logger.log("thunderbird launched and minimized")
@@ -290,9 +352,11 @@ class EnsureThunderbirdThread(QThread):
 
 def find_thunderbird_window() -> str | None:
     """Find the Thunderbird window ID via kdotool, or None if not found."""
+    if _kdotool is None:
+        return None
     try:
         result = subprocess.run(
-            ["kdotool", "search", "--name", "Thunderbird"],
+            [_kdotool, "search", "--name", "Thunderbird"],
             capture_output=True, text=True, timeout=2
         )
         window_ids = result.stdout.strip().splitlines()
@@ -322,7 +386,7 @@ def toggle_thunderbird_window() -> None:
         is_active = False
         try:
             active = subprocess.run(
-                ["kdotool", "getactivewindow"],
+                [_kdotool, "getactivewindow"],
                 capture_output=True, text=True, timeout=2
             )
             active_wid = active.stdout.strip()
@@ -335,7 +399,7 @@ def toggle_thunderbird_window() -> None:
             logger.log(f"minimizing window {wid}")
             try:
                 subprocess.run(
-                    ["kdotool", "windowminimize", wid],
+                    [_kdotool, "windowminimize", wid],
                     capture_output=True, timeout=2
                 )
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
@@ -344,7 +408,7 @@ def toggle_thunderbird_window() -> None:
             logger.log(f"activating window {wid}")
             try:
                 subprocess.run(
-                    ["kdotool", "windowactivate", wid],
+                    [_kdotool, "windowactivate", wid],
                     capture_output=True, timeout=2
                 )
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
@@ -377,7 +441,7 @@ def raise_thunderbird_window() -> None:
         logger.log(f"activating window {wid}")
         try:
             subprocess.run(
-                ["kdotool", "windowactivate", wid],
+                [_kdotool, "windowactivate", wid],
                 capture_output=True, timeout=2
             )
         except (subprocess.TimeoutExpired, FileNotFoundError) as e:
@@ -622,6 +686,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    config = load_config()
+    logger.debug = config.getboolean("General", "Debug", fallback=False)
+
+    global _kdotool
+    _kdotool = resolve_kdotool(config)
+    if _kdotool is None:
+        sys.exit(1)
 
     existing_pid = get_running_pid()
 
