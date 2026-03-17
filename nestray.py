@@ -24,17 +24,18 @@ try:
     from PyQt6.QtCore import QThread, pyqtSignal
     from PyQt6.QtGui import QIcon
     from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
+
     print("nestray: using qt6")
 except:
     try:
         from PyQt5.QtCore import QThread, pyqtSignal
         from PyQt5.QtGui import QIcon
         from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
+
         print("nestray: using qt5")
     except:
         print("you need pyqt6 or pyqt5 installed to run nestray")
         sys.exit(1)
-
 
 # --- Constants ---
 
@@ -100,7 +101,8 @@ def load_config() -> configparser.ConfigParser:
                 f.write("[General]\n")
                 f.write("# the period between polls of the IMAP folder, in seconds\n")
                 f.write(f"PollInterval={config.get('General', 'PollInterval')}\n")
-                f.write("# the maximum time to poll for the thunderbird window when attempting to raise it, in seconds\n")
+                f.write(
+                    "# the maximum time to poll for the thunderbird window when attempting to raise it, in seconds\n")
                 f.write(f"RaiseTimeout={config.get('General', 'RaiseTimeout')}\n")
                 f.write("# whether to raise desktop notifications for unread mail (1 = enabled, 0 = disabled)\n")
                 f.write(f"DesktopNotifications={config.get('General', 'DesktopNotifications')}\n")
@@ -461,6 +463,18 @@ def raise_thunderbird_window() -> None:
         print("nestray: thunderbird not found in your PATH", file=sys.stderr)
 
 
+def lower_thunderbird_window() -> None:
+    logger.log("lower requested")
+    wid = find_thunderbird_window()
+    if wid is not None:
+        logger.log(f"lowering window {wid}")
+        subprocess.run(
+            [_kdotool, "windowminimize", wid],
+            capture_output=True, timeout=2
+        )
+        logger.log("thunderbird minimized")
+
+
 class ToggleThread(QThread):
     """
     Toggles the Thunderbird window in a background thread so the tray
@@ -515,7 +529,8 @@ class NestrayApp:
         self.poll_interval = self.config.getint("General", "PollInterval", fallback=30)
         self.raise_timeout = self.config.getfloat("General", "RaiseTimeout", fallback=5.0)
         self.desktop_notifications = self.config.getboolean("General", "DesktopNotifications", fallback=True)
-        self.remind_interval = self.config.getint("General", "RemindInterval", fallback=30) * 60  # stored as minutes, used as seconds
+        self.remind_interval = self.config.getint("General", "RemindInterval",
+                                                  fallback=30) * 60  # stored as minutes, used as seconds
 
         # When --raise is passed on first startup, skip the initial minimize
         self._skip_first_minimize = raise_on_start
@@ -641,11 +656,13 @@ class NestrayApp:
         self.tray.hide()
         self.app.quit()
 
+
 def write_pid_file(pidfile):
     with open(pidfile, "w") as fp:
         pid = str(os.getpid())
         logger.log(f"writing pidfile with pid {pid}")
         fp.write(pid)
+
 
 def get_running_pid() -> int | None:
     """
@@ -681,6 +698,18 @@ def parse_args() -> argparse.Namespace:
              "raises the window and exits. If starting fresh, "
              "skips the initial window minimize.",
     )
+    parser.add_argument(
+        "--lower",
+        dest="lower_window",
+        action="store_true",
+        help="Lower (minimise) the Thunderbird window, if found"
+    )
+    parser.add_argument(
+        "--toggle",
+        dest="toggle_window",
+        action="store_true",
+        help="Like --raise, but will minimize Thunderbird if it's already running"
+    )
     return parser.parse_args()
 
 
@@ -701,6 +730,12 @@ def main() -> None:
         if args.raise_window:
             logger.log(f"raising thunderbird window")
             raise_thunderbird_window()
+        elif args.toggle_window:
+            logger.log(f"toggling thunderbird window")
+            toggle_thunderbird_window()
+        elif args.lower_window:
+            logger.log(f"lowering thunderbird window")
+            lower_thunderbird_window()
         else:
             print(f"nestray is already running with pid {existing_pid}")
         sys.exit(1)
@@ -712,8 +747,10 @@ def main() -> None:
         print("nestray: system tray not available", file=sys.stderr)
         sys.exit(1)
 
-    nestray = NestrayApp(app, raise_on_start=args.raise_window)  # noqa: F841 — keep reference alive
+    nestray = NestrayApp(app,
+                         raise_on_start=args.raise_window or args.toggle_window)  # noqa: F841 — keep reference alive
     sys.exit(app.exec())
+
 
 def install_application_menu_item_if_necessary():
     desktop_file = "nestray.desktop";
@@ -738,6 +775,7 @@ def install_application_menu_item_if_necessary():
             to_write = line.replace("$INSTALL_PATH$", my_dir)
             fp.write(f"{to_write}\n")
     logger.log(f"installed desktop file at: {target}")
+
 
 if __name__ == "__main__":
     install_application_menu_item_if_necessary()
