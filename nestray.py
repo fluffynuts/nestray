@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 qt5_forced = os.getenv("FORCE_QT5")
@@ -37,6 +38,36 @@ except:
         print("you need pyqt6 or pyqt5 installed to run nestray")
         sys.exit(1)
 
+watchdog_enabled = False
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler, FileModifiedEvent, DirModifiedEvent
+    watchdog_enabled = True
+
+    class MailboxObserver(FileSystemEventHandler):
+        def __init__(self, files: list[Path], poll: Callable[[], None]):
+            self.poll = poll
+            self.files = files
+
+        def on_modified(self, event: DirModifiedEvent | FileModifiedEvent) -> None:
+            modified = str(event.src_path)
+            logger.log(f"modified: {modified}")
+            should_poll = any(str(p) == modified for p in self.files)
+            if should_poll:
+                self.poll()
+except:
+    print(
+        """
+        The python 'watchdog' module was not found. This is an OPTIONAL dependency:
+        
+        Without this module, nestray falls back on polling ONLY, meaning that your notifications
+        may appear to come a little after the mail is visible in Thunderbird, and will not clear
+        immediately when you read the last mail that was unread.
+        
+        If you install the python watchdog module, you'll have more immediate notifications and
+        the systray icon will respond quicker to you having read all mail in your inbox.
+        """
+    )
 # --- Constants ---
 
 CONFIG_PATH = Path.home() / ".config" / "nestray.ini"
@@ -62,7 +93,7 @@ have_no_unread_mail_icon = "mail-mark-unread"
 class Logger:
     """Simple debug logger. Only prints when debug mode is enabled."""
 
-    def __init__(self, debug: bool = True):
+    def __init__(self, debug: bool = False):
         self.debug = debug
 
     def log(self, msg: str) -> None:
@@ -216,7 +247,7 @@ def find_inbox_msf_files(profile_path: Path) -> list[Path]:
     """
     smart = profile_path / "Mail" / "smart mailboxes" / "Inbox.msf"
     if smart.exists() and smart.stat().st_size > 0:
-        print(f"found unified inbox: {smart}")
+        logger.log(f"found unified inbox: {smart}")
         return [smart]
 
     msf_files: list[Path] = []
@@ -280,7 +311,7 @@ def get_total_unread(profile_path: Path) -> int:
     aggregates from individual IMAP/local/POP3 account inboxes.
     """
     total = 0
-    print(f"looking for msf files under {profile_path}")
+    logger.log(f"looking for msf files under {profile_path}")
     for msf_path in find_inbox_msf_files(profile_path):
         total += get_unread_from_msf(msf_path)
     return total
@@ -498,10 +529,29 @@ class MailPoller(QThread):
         self.profile_path = profile_path
         self.interval = interval
         self._stop_event = threading.Event()
+        self.is_polling = False
+        if watchdog_enabled:
+            self.observer = Observer()
 
     def run(self) -> None:
+        if watchdog_enabled:
+            files = find_inbox_msf_files(self.profile_path)
+            self.observer.schedule(MailboxObserver(files, self.poll), path=self.profile_path, recursive=True)
+            self.observer.start()
+        self.poll()
         while not self._stop_event.is_set():
-            # Ask the main thread to ensure TB is running (non-blocking)
+            if not watchdog_enabled:
+                self.poll()
+
+    def poll(self):
+        # Ask the main thread to ensure TB is running (non-blocking)
+        if self.is_polling:
+            logger.log("poll requested, but already polling")
+            return
+
+        self.is_polling = True
+        logger.log("polling mailboxes")
+        try:
             if not is_thunderbird_running():
                 self.ensure_thunderbird.emit()
             self.poll_started.emit()
@@ -513,9 +563,13 @@ class MailPoller(QThread):
                 unread = 0
             self.poll_finished.emit(unread)
             self._stop_event.wait(self.interval)
+        finally:
+            self.is_polling = False
 
     def stop(self) -> None:
         self._stop_event.set()
+        if watchdog_enabled:
+            self.observer.stop()
         self.wait()
 
 
@@ -710,14 +764,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Like --raise, but will minimize Thunderbird if it's already running"
     )
+    parser.add_argument(
+        "--debug",
+        dest="debug",
+        action="store_true",
+        help="Enable much more logging at the console"
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-
     config = load_config()
-    logger.debug = config.getboolean("General", "Debug", fallback=False)
+    logger.debug = config.getboolean("General", "Debug", fallback=args.debug)
 
     global _kdotool
     _kdotool = resolve_kdotool(config)
